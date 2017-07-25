@@ -22,15 +22,13 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
 import javax.annotation.Nullable;
-import java.io.Serializable;
 import java.util.*;
 
 /**
  * Used as a key for memory map (to avoid having to think about NetworkParameters,
  * which is required for {@link TransactionOutPoint}
  */
-class StoredTransactionOutPoint implements Serializable {
-    private static final long serialVersionUID = -4064230006297064377L;
+class StoredTransactionOutPoint {
 
     /** Hash of the transaction to which we refer. */
     Sha256Hash hash;
@@ -63,12 +61,12 @@ class StoredTransactionOutPoint implements Serializable {
 
     @Override
     public int hashCode() {
-        return this.hash.hashCode() + (int)index;
+        return Objects.hashCode(getIndex(), getHash());
     }
     
     @Override
     public String toString() {
-        return "Stored transaction out point: " + hash.toString() + ":" + index;
+        return "Stored transaction out point: " + hash + ":" + index;
     }
 
     @Override
@@ -76,8 +74,7 @@ class StoredTransactionOutPoint implements Serializable {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         StoredTransactionOutPoint other = (StoredTransactionOutPoint) o;
-        return getIndex() == other.getIndex() &&
-               Objects.equal(getHash(), other.getHash());
+        return getIndex() == other.getIndex() && Objects.equal(getHash(), other.getHash());
     }
 }
 
@@ -93,10 +90,10 @@ class TransactionalHashMap<KeyType, ValueType> {
     HashMap<KeyType, ValueType> map;
     
     public TransactionalHashMap() {
-        tempMap = new ThreadLocal<HashMap<KeyType, ValueType>>();
-        tempSetRemoved = new ThreadLocal<HashSet<KeyType>>();
-        inTransaction = new ThreadLocal<Boolean>();
-        map = new HashMap<KeyType, ValueType>();
+        tempMap = new ThreadLocal<>();
+        tempSetRemoved = new ThreadLocal<>();
+        inTransaction = new ThreadLocal<>();
+        map = new HashMap<>();
     }
     
     public void beginDatabaseBatchWrite() {
@@ -134,7 +131,7 @@ class TransactionalHashMap<KeyType, ValueType> {
     }
 
     public List<ValueType> values() {
-        List<ValueType> valueTypes = new ArrayList<ValueType>();
+        List<ValueType> valueTypes = new ArrayList<>();
         for (KeyType keyType : map.keySet()) {
             valueTypes.add(get(keyType));
         }
@@ -185,8 +182,8 @@ class TransactionalMultiKeyHashMap<UniqueKeyType, MultiKeyType, ValueType> {
     HashMap<MultiKeyType, Set<UniqueKeyType>> mapKeys;
     
     public TransactionalMultiKeyHashMap() {
-        mapValues = new TransactionalHashMap<UniqueKeyType, ValueType>();
-        mapKeys = new HashMap<MultiKeyType, Set<UniqueKeyType>>();
+        mapValues = new TransactionalHashMap<>();
+        mapKeys = new HashMap<>();
     }
     
     public void BeginTransaction() {
@@ -210,7 +207,7 @@ class TransactionalMultiKeyHashMap<UniqueKeyType, MultiKeyType, ValueType> {
         mapValues.put(uniqueKey, value);
         Set<UniqueKeyType> set = mapKeys.get(multiKey);
         if (set == null) {
-            set = new HashSet<UniqueKeyType>();
+            set = new HashSet<>();
             set.add(uniqueKey);
             mapKeys.put(multiKey, set);
         }else{
@@ -235,7 +232,7 @@ class TransactionalMultiKeyHashMap<UniqueKeyType, MultiKeyType, ValueType> {
  * Keeps {@link StoredBlock}s, {@link StoredUndoableBlock}s and {@link org.bitcoinj.core.UTXO}s in memory.
  * Used primarily for unit testing.
  */
-public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore, UTXOProvider {
+public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore {
     protected static class StoredBlockAndWasUndoableFlag {
         public StoredBlock block;
         public boolean wasUndoable;
@@ -256,9 +253,9 @@ public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore, UTXOPro
      * @param fullStoreDepth The depth of blocks to keep FullStoredBlocks instead of StoredBlocks
      */
     public MemoryFullPrunedBlockStore(NetworkParameters params, int fullStoreDepth) {
-        blockMap = new TransactionalHashMap<Sha256Hash, StoredBlockAndWasUndoableFlag>();
-        fullBlockMap = new TransactionalMultiKeyHashMap<Sha256Hash, Integer, StoredUndoableBlock>();
-        transactionOutputMap = new TransactionalHashMap<StoredTransactionOutPoint, UTXO>();
+        blockMap = new TransactionalHashMap<>();
+        fullBlockMap = new TransactionalMultiKeyHashMap<>();
+        transactionOutputMap = new TransactionalHashMap<>();
         this.fullStoreDepth = fullStoreDepth > 0 ? fullStoreDepth : 1;
         // Insert the genesis block.
         try {
@@ -285,7 +282,7 @@ public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore, UTXOPro
     }
     
     @Override
-    public synchronized void put(StoredBlock storedBlock, StoredUndoableBlock undoableBlock) throws BlockStoreException {
+    public synchronized final void put(StoredBlock storedBlock, StoredUndoableBlock undoableBlock) throws BlockStoreException {
         Preconditions.checkNotNull(blockMap, "MemoryFullPrunedBlockStore is closed");
         Sha256Hash hash = storedBlock.getHeader().getHash();
         fullBlockMap.put(hash, storedBlock.getHeight(), undoableBlock);
@@ -322,7 +319,7 @@ public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore, UTXOPro
     }
 
     @Override
-    public synchronized void setChainHead(StoredBlock chainHead) throws BlockStoreException {
+    public synchronized final void setChainHead(StoredBlock chainHead) throws BlockStoreException {
         Preconditions.checkNotNull(blockMap, "MemoryFullPrunedBlockStore is closed");
         this.chainHead = chainHead;
     }
@@ -334,7 +331,7 @@ public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore, UTXOPro
     }
 
     @Override
-    public synchronized void setVerifiedChainHead(StoredBlock chainHead) throws BlockStoreException {
+    public synchronized final void setVerifiedChainHead(StoredBlock chainHead) throws BlockStoreException {
         Preconditions.checkNotNull(blockMap, "MemoryFullPrunedBlockStore is closed");
         this.verifiedChainHead = chainHead;
         if (this.chainHead.getHeight() < chainHead.getHeight())
@@ -418,7 +415,7 @@ public class MemoryFullPrunedBlockStore implements FullPrunedBlockStore, UTXOPro
     public List<UTXO> getOpenTransactionOutputs(List<Address> addresses) throws UTXOProviderException {
         // This is *NOT* optimal: We go through all the outputs and select the ones we are looking for.
         // If someone uses this store for production then they have a lot more to worry about than an inefficient impl :)
-        List<UTXO> foundOutputs = new ArrayList<UTXO>();
+        List<UTXO> foundOutputs = new ArrayList<>();
         List<UTXO> outputsList = transactionOutputMap.values();
         for (UTXO output : outputsList) {
             for (Address address : addresses) {

@@ -20,6 +20,9 @@ package org.bitcoinj.protocols.channels;
 import org.bitcoinj.core.*;
 import org.bitcoinj.protocols.channels.PaymentChannelCloseException.CloseReason;
 import org.bitcoinj.utils.Threading;
+import org.bitcoinj.wallet.SendRequest;
+import org.bitcoinj.wallet.Wallet;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.MoreExecutors;
@@ -52,11 +55,12 @@ import static com.google.common.base.Preconditions.checkState;
  */
 public class PaymentChannelClient implements IPaymentChannelClient {
     private static final org.slf4j.Logger log = LoggerFactory.getLogger(PaymentChannelClient.class);
-    private static final int CLIENT_MAJOR_VERSION = 1;
-    public final int CLIENT_MINOR_VERSION = 0;
-    private static final int SERVER_MAJOR_VERSION = 1;
 
     protected final ReentrantLock lock = Threading.lock("channelclient");
+    protected final ClientChannelProperties clientChannelProperties;
+
+    // Used to track the negotiated version number
+    @GuardedBy("lock") private int majorVersion;
 
     @GuardedBy("lock") private final ClientConnection conn;
 
@@ -78,6 +82,42 @@ public class PaymentChannelClient implements IPaymentChannelClient {
         CHANNEL_CLOSED,
     }
     @GuardedBy("lock") private InitStep step = InitStep.WAITING_FOR_CONNECTION_OPEN;
+
+    public enum VersionSelector {
+        VERSION_1,
+        VERSION_2_ALLOW_1,
+        VERSION_2;
+
+        public int getRequestedMajorVersion() {
+            switch (this) {
+                case VERSION_1:
+                    return 1;
+                case VERSION_2_ALLOW_1:
+                case VERSION_2:
+                default:
+                    return 2;
+            }
+        }
+
+        public int getRequestedMinorVersion() {
+            return 0;
+        }
+
+        public boolean isServerVersionAccepted(int major, int minor) {
+            switch (this) {
+                case VERSION_1:
+                    return major == 1;
+                case VERSION_2_ALLOW_1:
+                    return major == 1 || major == 2;
+                case VERSION_2:
+                    return major == 2;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    private final VersionSelector versionSelector;
 
     // Will either hold the StoredClientChannel of this channel or null after connectionOpen
     private StoredClientChannel storedChannel;
@@ -130,7 +170,7 @@ public class PaymentChannelClient implements IPaymentChannelClient {
      *             the server)
      */
     public PaymentChannelClient(Wallet wallet, ECKey myKey, Coin maxValue, Sha256Hash serverId, ClientConnection conn) {
-      this(wallet,myKey,maxValue,serverId, DEFAULT_TIME_WINDOW, null, conn);
+        this(wallet,myKey,maxValue,serverId, null, conn);
     }
 
     /**
@@ -146,23 +186,50 @@ public class PaymentChannelClient implements IPaymentChannelClient {
      * @param serverId An arbitrary hash representing this channel. This must uniquely identify the server. If an
      *                 existing stored channel exists in the wallet's {@link StoredPaymentChannelClientStates}, then an
      *                 attempt will be made to resume that channel.
-     * @param timeWindow The time in seconds, relative to now, on how long this channel should be kept open. Note that is is
-     *                   a proposal to the server. The server may in turn propose something different.
-     *                   See {@link org.bitcoinj.protocols.channels.IPaymentChannelClient.ClientConnection#acceptExpireTime(long)}
      * @param userKeySetup Key derived from a user password, used to decrypt myKey, if it is encrypted, during setup.
      * @param conn A callback listener which represents the connection to the server (forwards messages we generate to
      *             the server)
      */
-    public PaymentChannelClient(Wallet wallet, ECKey myKey, Coin maxValue, Sha256Hash serverId, long timeWindow,
+    public PaymentChannelClient(Wallet wallet, ECKey myKey, Coin maxValue, Sha256Hash serverId,
                                 @Nullable KeyParameter userKeySetup, ClientConnection conn) {
+        this(wallet, myKey, maxValue, serverId, userKeySetup, defaultChannelProperties, conn);
+    }
+
+    /**
+     * Constructs a new channel manager which waits for {@link PaymentChannelClient#connectionOpen()} before acting.
+     *
+     * @param wallet The wallet which will be paid from, and where completed transactions will be committed.
+     *               Must already have a {@link StoredPaymentChannelClientStates} object in its extensions set.
+     * @param myKey A freshly generated keypair used for the multisig contract and refund output.
+     * @param maxValue The maximum value the server is allowed to request that we lock into this channel until the
+     *                 refund transaction unlocks. Note that if there is a previously open channel, the refund
+     *                 transaction used in this channel may be larger than maxValue. Thus, maxValue is not a method for
+     *                 limiting the amount payable through this channel.
+     * @param serverId An arbitrary hash representing this channel. This must uniquely identify the server. If an
+     *                 existing stored channel exists in the wallet's {@link StoredPaymentChannelClientStates}, then an
+     *                 attempt will be made to resume that channel.
+     * @param userKeySetup Key derived from a user password, used to decrypt myKey, if it is encrypted, during setup.
+     * @param clientChannelProperties Modify the channel's properties. You may extend {@link DefaultClientChannelProperties}
+     * @param conn A callback listener which represents the connection to the server (forwards messages we generate to
+     *             the server)
+     */
+    public PaymentChannelClient(Wallet wallet, ECKey myKey, Coin maxValue, Sha256Hash serverId,
+                                @Nullable KeyParameter userKeySetup, @Nullable ClientChannelProperties clientChannelProperties,
+                                ClientConnection conn) {
         this.wallet = checkNotNull(wallet);
         this.myKey = checkNotNull(myKey);
         this.maxValue = checkNotNull(maxValue);
         this.serverId = checkNotNull(serverId);
-        checkState(timeWindow >= 0);
-        this.timeWindow = timeWindow;
         this.conn = checkNotNull(conn);
         this.userKeySetup = userKeySetup;
+        if (clientChannelProperties == null) {
+            this.clientChannelProperties = defaultChannelProperties;
+        } else {
+            this.clientChannelProperties = clientChannelProperties;
+        }
+        this.timeWindow = clientChannelProperties.timeWindow();
+        checkState(timeWindow >= 0);
+        this.versionSelector = clientChannelProperties.versionSelector();
     }
 
     /** 
@@ -203,46 +270,92 @@ public class PaymentChannelClient implements IPaymentChannelClient {
 
         // For now we require a hard-coded value. In future this will have to get more complex and dynamic as the fees
         // start to float.
-        final long MIN_PAYMENT = Transaction.REFERENCE_DEFAULT_MIN_TX_FEE.value;
-        if (initiate.getMinPayment() != MIN_PAYMENT) {
-            log.error("Server requested a min payment of {} but we expected {}", initiate.getMinPayment(), MIN_PAYMENT);
+        final long maxMin = clientChannelProperties.acceptableMinPayment().value;
+        if (initiate.getMinPayment() > maxMin) {
+            log.error("Server requested a min payment of {} but we only accept up to {}", initiate.getMinPayment(), maxMin);
             errorBuilder.setCode(Protos.Error.ErrorCode.MIN_PAYMENT_TOO_LARGE);
-            errorBuilder.setExpectedValue(MIN_PAYMENT);
-            missing = Coin.valueOf(initiate.getMinPayment() - MIN_PAYMENT);
+            errorBuilder.setExpectedValue(maxMin);
+            missing = Coin.valueOf(initiate.getMinPayment() - maxMin);
             return CloseReason.SERVER_REQUESTED_TOO_MUCH_VALUE;
         }
 
         final byte[] pubKeyBytes = initiate.getMultisigKey().toByteArray();
         if (!ECKey.isPubKeyCanonical(pubKeyBytes))
             throw new VerificationException("Server gave us a non-canonical public key, protocol error.");
-        state = new PaymentChannelClientState(wallet, myKey, ECKey.fromPublicOnly(pubKeyBytes), contractValue, expireTime);
+        switch (majorVersion) {
+            case 1:
+                state = new PaymentChannelV1ClientState(wallet, myKey, ECKey.fromPublicOnly(pubKeyBytes), contractValue, expireTime);
+                break;
+            case 2:
+                state = new PaymentChannelV2ClientState(wallet, myKey, ECKey.fromPublicOnly(pubKeyBytes), contractValue, expireTime);
+                break;
+            default:
+                return CloseReason.NO_ACCEPTABLE_VERSION;
+        }
         try {
-            state.initiate(userKeySetup);
+            state.initiate(userKeySetup, clientChannelProperties);
         } catch (ValueOutOfRangeException e) {
             log.error("Value out of range when trying to initiate", e);
             errorBuilder.setCode(Protos.Error.ErrorCode.CHANNEL_VALUE_TOO_LARGE);
             return CloseReason.SERVER_REQUESTED_TOO_MUCH_VALUE;
         }
         minPayment = initiate.getMinPayment();
-        step = InitStep.WAITING_FOR_REFUND_RETURN;
+        switch (majorVersion) {
+            case 1:
+                step = InitStep.WAITING_FOR_REFUND_RETURN;
 
-        Protos.ProvideRefund.Builder provideRefundBuilder = Protos.ProvideRefund.newBuilder()
-                .setMultisigKey(ByteString.copyFrom(myKey.getPubKey()))
-                .setTx(ByteString.copyFrom(state.getIncompleteRefundTransaction().bitcoinSerialize()));
+                Protos.ProvideRefund.Builder provideRefundBuilder = Protos.ProvideRefund.newBuilder()
+                        .setMultisigKey(ByteString.copyFrom(myKey.getPubKey()))
+                        .setTx(ByteString.copyFrom(((PaymentChannelV1ClientState)state).getIncompleteRefundTransaction().unsafeBitcoinSerialize()));
 
-        conn.sendToServer(Protos.TwoWayChannelMessage.newBuilder()
-                .setProvideRefund(provideRefundBuilder)
-                .setType(Protos.TwoWayChannelMessage.MessageType.PROVIDE_REFUND)
-                .build());
+                conn.sendToServer(Protos.TwoWayChannelMessage.newBuilder()
+                        .setProvideRefund(provideRefundBuilder)
+                        .setType(Protos.TwoWayChannelMessage.MessageType.PROVIDE_REFUND)
+                        .build());
+                break;
+            case 2:
+                step = InitStep.WAITING_FOR_CHANNEL_OPEN;
+
+                // Before we can send the server the contract (ie send it to the network), we must ensure that our refund
+                // transaction is safely in the wallet - thus we store it (this also keeps it up-to-date when we pay)
+                state.storeChannelInWallet(serverId);
+
+                Protos.ProvideContract.Builder provideContractBuilder = Protos.ProvideContract.newBuilder()
+                        .setTx(ByteString.copyFrom(state.getContract().unsafeBitcoinSerialize()))
+                        .setClientKey(ByteString.copyFrom(myKey.getPubKey()));
+                try {
+                    // Make an initial payment of the dust limit, and put it into the message as well. The size of the
+                    // server-requested dust limit was already sanity checked by this point.
+                    PaymentChannelClientState.IncrementedPayment payment = state().incrementPaymentBy(Coin.valueOf(minPayment), userKeySetup);
+                    Protos.UpdatePayment.Builder initialMsg = provideContractBuilder.getInitialPaymentBuilder();
+                    initialMsg.setSignature(ByteString.copyFrom(payment.signature.encodeToBitcoin()));
+                    initialMsg.setClientChangeValue(state.getValueRefunded().value);
+                } catch (ValueOutOfRangeException e) {
+                    throw new IllegalStateException(e);  // This cannot happen.
+                }
+
+                // Not used any more
+                userKeySetup = null;
+
+                final Protos.TwoWayChannelMessage.Builder msg = Protos.TwoWayChannelMessage.newBuilder();
+                msg.setProvideContract(provideContractBuilder);
+                msg.setType(Protos.TwoWayChannelMessage.MessageType.PROVIDE_CONTRACT);
+                conn.sendToServer(msg.build());
+                break;
+            default:
+                return CloseReason.NO_ACCEPTABLE_VERSION;
+        }
         return null;
     }
 
     @GuardedBy("lock")
     private void receiveRefund(Protos.TwoWayChannelMessage refundMsg, @Nullable KeyParameter userKey) throws VerificationException {
+        checkState(majorVersion == 1);
         checkState(step == InitStep.WAITING_FOR_REFUND_RETURN && refundMsg.hasReturnRefund());
         log.info("Got RETURN_REFUND message, providing signed contract");
         Protos.ReturnRefund returnedRefund = refundMsg.getReturnRefund();
-        state.provideRefundSignature(returnedRefund.getSignature().toByteArray(), userKey);
+        // Cast is safe since we've checked the version number
+        ((PaymentChannelV1ClientState)state).provideRefundSignature(returnedRefund.getSignature().toByteArray(), userKey);
         step = InitStep.WAITING_FOR_CHANNEL_OPEN;
 
         // Before we can send the server the contract (ie send it to the network), we must ensure that our refund
@@ -250,7 +363,7 @@ public class PaymentChannelClient implements IPaymentChannelClient {
         state.storeChannelInWallet(serverId);
 
         Protos.ProvideContract.Builder contractMsg = Protos.ProvideContract.newBuilder()
-                .setTx(ByteString.copyFrom(state.getMultisigContract().bitcoinSerialize()));
+                .setTx(ByteString.copyFrom(state.getContract().unsafeBitcoinSerialize()));
         try {
             // Make an initial payment of the dust limit, and put it into the message as well. The size of the
             // server-requested dust limit was already sanity checked by this point.
@@ -277,7 +390,16 @@ public class PaymentChannelClient implements IPaymentChannelClient {
         if (step == InitStep.WAITING_FOR_INITIATE) {
             // We skipped the initiate step, because a previous channel that's still valid was resumed.
             wasInitiated  = false;
-            state = new PaymentChannelClientState(storedChannel, wallet);
+            switch (majorVersion) {
+                case 1:
+                    state = new PaymentChannelV1ClientState(storedChannel, wallet);
+                    break;
+                case 2:
+                    state = new PaymentChannelV2ClientState(storedChannel, wallet);
+                    break;
+                default:
+                    throw new IllegalStateException("Invalid version number " + majorVersion);
+            }
         }
         step = InitStep.CHANNEL_OPEN;
         // channelOpen should disable timeouts, but
@@ -302,7 +424,8 @@ public class PaymentChannelClient implements IPaymentChannelClient {
                         checkState(step == InitStep.WAITING_FOR_VERSION_NEGOTIATION && msg.hasServerVersion());
                         // Server might send back a major version lower than our own if they want to fallback to a
                         // lower version. We can't handle that, so we just close the channel.
-                        if (msg.getServerVersion().getMajor() != SERVER_MAJOR_VERSION) {
+                        majorVersion = msg.getServerVersion().getMajor();
+                        if (!versionSelector.isServerVersionAccepted(majorVersion, msg.getServerVersion().getMinor())) {
                             errorBuilder = Protos.Error.newBuilder()
                                     .setCode(Protos.Error.ErrorCode.NO_ACCEPTABLE_VERSION);
                             closeReason = CloseReason.NO_ACCEPTABLE_VERSION;
@@ -338,20 +461,24 @@ public class PaymentChannelClient implements IPaymentChannelClient {
                         checkState(msg.hasError());
                         log.error("Server sent ERROR {} with explanation {}", msg.getError().getCode().name(),
                                 msg.getError().hasExplanation() ? msg.getError().getExplanation() : "");
+                        setIncreasePaymentFutureIfNeeded(CloseReason.REMOTE_SENT_ERROR, msg.getError().getCode().name());
                         conn.destroyConnection(CloseReason.REMOTE_SENT_ERROR);
                         return;
                     default:
                         log.error("Got unknown message type or type that doesn't apply to clients.");
                         errorBuilder = Protos.Error.newBuilder()
                                 .setCode(Protos.Error.ErrorCode.SYNTAX_ERROR);
+                        setIncreasePaymentFutureIfNeeded(CloseReason.REMOTE_SENT_INVALID_MESSAGE, "");
                         closeReason = CloseReason.REMOTE_SENT_INVALID_MESSAGE;
                         break;
                 }
             } catch (VerificationException e) {
                 log.error("Caught verification exception handling message from server", e);
                 errorBuilder = Protos.Error.newBuilder()
-                        .setCode(Protos.Error.ErrorCode.BAD_TRANSACTION)
-                        .setExplanation(e.getMessage());
+                        .setCode(Protos.Error.ErrorCode.BAD_TRANSACTION);
+                final String message = e.getMessage();
+                if (message != null)
+                    errorBuilder.setExplanation(message);
                 closeReason = CloseReason.REMOTE_SENT_INVALID_MESSAGE;
             } catch (IllegalStateException e) {
                 log.error("Caught illegal state exception handling message from server", e);
@@ -369,11 +496,23 @@ public class PaymentChannelClient implements IPaymentChannelClient {
         }
     }
 
+    /*
+     * If this is an ongoing payment channel increase we need to call setException() on its future.
+     *
+     * @param reason is the reason for aborting
+     * @param message is the detailed message
+     */
+    private void setIncreasePaymentFutureIfNeeded(PaymentChannelCloseException.CloseReason reason, String message) {
+        if (increasePaymentFuture != null && !increasePaymentFuture.isDone()) {
+            increasePaymentFuture.setException(new PaymentChannelCloseException(message, reason));
+        }
+    }
+
     @GuardedBy("lock")
     private void receiveClose(Protos.TwoWayChannelMessage msg) throws VerificationException {
         checkState(lock.isHeldByCurrentThread());
         if (msg.hasSettlement()) {
-            Transaction settleTx = new Transaction(wallet.getParams(), msg.getSettlement().getTx().toByteArray());
+            Transaction settleTx = wallet.getParams().getDefaultSerializer().makeTransaction(msg.getSettlement().getTx().toByteArray());
             log.info("CLOSE message received with settlement tx {}", settleTx.getHash());
             // TODO: set source
             if (state != null && state().isSettlementTransaction(settleTx)) {
@@ -460,8 +599,8 @@ public class PaymentChannelClient implements IPaymentChannelClient {
             step = InitStep.WAITING_FOR_VERSION_NEGOTIATION;
 
             Protos.ClientVersion.Builder versionNegotiationBuilder = Protos.ClientVersion.newBuilder()
-                    .setMajor(CLIENT_MAJOR_VERSION)
-                    .setMinor(CLIENT_MINOR_VERSION)
+                    .setMajor(versionSelector.getRequestedMajorVersion())
+                    .setMinor(versionSelector.getRequestedMinorVersion())
                     .setTimeWindowSecs(timeWindow);
 
             if (storedChannel != null) {
@@ -543,7 +682,7 @@ public class PaymentChannelClient implements IPaymentChannelClient {
             if (wallet.isEncrypted() && userKey == null)
                 throw new ECKey.KeyIsEncryptedException();
 
-            PaymentChannelClientState.IncrementedPayment payment = state().incrementPaymentBy(size, userKey);
+            PaymentChannelV1ClientState.IncrementedPayment payment = state().incrementPaymentBy(size, userKey);
             Protos.UpdatePayment.Builder updatePaymentBuilder = Protos.UpdatePayment.newBuilder()
                     .setSignature(ByteString.copyFrom(payment.signature.encodeToBitcoin()))
                     .setClientChangeValue(state.getValueRefunded().value);
@@ -557,7 +696,7 @@ public class PaymentChannelClient implements IPaymentChannelClient {
                     increasePaymentFuture = null;
                     lock.unlock();
                 }
-            }, MoreExecutors.sameThreadExecutor());
+            }, MoreExecutors.directExecutor());
 
             conn.sendToServer(Protos.TwoWayChannelMessage.newBuilder()
                     .setUpdatePayment(updatePaymentBuilder)
@@ -588,4 +727,28 @@ public class PaymentChannelClient implements IPaymentChannelClient {
         // Ensure the future runs without the client lock held.
         future.set(new PaymentIncrementAck(value, paymentAck.getInfo()));
     }
+
+    public static class DefaultClientChannelProperties implements ClientChannelProperties {
+
+        @Override
+        public SendRequest modifyContractSendRequest(SendRequest sendRequest) {
+            return sendRequest;
+        }
+
+        @Override
+        public Coin acceptableMinPayment() { return Transaction.REFERENCE_DEFAULT_MIN_TX_FEE; }
+
+        @Override
+        public long timeWindow() {
+            return DEFAULT_TIME_WINDOW;
+        }
+
+        @Override
+        public VersionSelector versionSelector() {
+            return VersionSelector.VERSION_2_ALLOW_1;
+        }
+
+    }
+
+    public static DefaultClientChannelProperties defaultChannelProperties = new DefaultClientChannelProperties();
 }

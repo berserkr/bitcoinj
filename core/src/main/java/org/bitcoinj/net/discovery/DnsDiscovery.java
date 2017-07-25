@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright 2011 John Sample
  * Copyright 2014 Andreas Schildbach
  *
@@ -56,9 +56,10 @@ public class DnsDiscovery extends MultiplexingDiscovery {
     }
 
     private static List<PeerDiscovery> buildDiscoveries(NetworkParameters params, String[] seeds) {
-        List<PeerDiscovery> discoveries = new ArrayList<PeerDiscovery>(seeds.length);
-        for (String seed : seeds)
-            discoveries.add(new DnsSeedDiscovery(params, seed));
+        List<PeerDiscovery> discoveries = new ArrayList<>();
+        if (seeds != null)
+            for (String seed : seeds)
+                discoveries.add(new DnsSeedDiscovery(params, seed));
         return discoveries;
     }
 
@@ -67,9 +68,9 @@ public class DnsDiscovery extends MultiplexingDiscovery {
         // Attempted workaround for reported bugs on Linux in which gethostbyname does not appear to be properly
         // thread safe and can cause segfaults on some libc versions.
         if (System.getProperty("os.name").toLowerCase().contains("linux"))
-            return Executors.newSingleThreadExecutor(new DaemonThreadFactory());
+            return Executors.newSingleThreadExecutor(new ContextPropagatingThreadFactory("DNS seed lookups"));
         else
-            return Executors.newFixedThreadPool(seeds.size(), new DaemonThreadFactory());
+            return Executors.newFixedThreadPool(seeds.size(), new DaemonThreadFactory("DNS seed lookups"));
     }
 
     /** Implements discovery from a single DNS host. */
@@ -83,7 +84,9 @@ public class DnsDiscovery extends MultiplexingDiscovery {
         }
 
         @Override
-        public InetSocketAddress[] getPeers(long timeoutValue, TimeUnit timeoutUnit) throws PeerDiscoveryException {
+        public InetSocketAddress[] getPeers(long services, long timeoutValue, TimeUnit timeoutUnit) throws PeerDiscoveryException {
+            if (services != 0)
+                throw new PeerDiscoveryException("DNS seeds cannot filter by services: " + services);
             try {
                 InetAddress[] response = InetAddress.getAllByName(hostname);
                 InetSocketAddress[] result = new InetSocketAddress[response.length];
@@ -97,6 +100,11 @@ public class DnsDiscovery extends MultiplexingDiscovery {
 
         @Override
         public void shutdown() {
+        }
+
+        @Override
+        public String toString() {
+            return hostname;
         }
     }
 }

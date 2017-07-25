@@ -23,6 +23,7 @@ import com.google.common.util.concurrent.ListenableFuture;
 
 import com.google.protobuf.ByteString;
 import org.bitcoin.paymentchannel.Protos;
+import org.bitcoinj.wallet.SendRequest;
 import org.spongycastle.crypto.params.KeyParameter;
 
 import javax.annotation.Nullable;
@@ -132,7 +133,7 @@ public interface IPaymentChannelClient {
          * @param expireTime The time, in seconds,  when this channel will be closed by the server. Note this is in absolute time, i.e. seconds since 1970-01-01T00:00:00.
          * @return <code>true</code> if the proposed time is acceptable <code>false</code> otherwise.
          */
-        public boolean acceptExpireTime(long expireTime);
+        boolean acceptExpireTime(long expireTime);
 
         /**
          * <p>Indicates the channel has been successfully opened and
@@ -145,6 +146,41 @@ public interface IPaymentChannelClient {
          * @param wasInitiated If true, the channel is newly opened. If false, it was resumed.
          */
         void channelOpen(boolean wasInitiated);
+    }
+
+    /**
+     * Set Client payment channel properties.
+     */
+    interface ClientChannelProperties {
+        /**
+         * Modify the sendRequest used for the contract.
+         * @param sendRequest the current sendRequest.
+         * @return the modified sendRequest.
+         */
+        SendRequest modifyContractSendRequest(SendRequest sendRequest);
+
+        /**
+         *  The maximum acceptable min payment. If the server suggests a higher amount
+         *  the channel creation will be aborted.
+         */
+        Coin acceptableMinPayment();
+
+        /**
+         *  The time in seconds, relative to now, on how long this channel should be kept open. Note that is is
+         *  a proposal to the server. The server may in turn propose something different.
+         *  See {@link org.bitcoinj.protocols.channels.IPaymentChannelClient.ClientConnection#acceptExpireTime(long)}
+         *
+         */
+        long timeWindow();
+
+        /**
+         * An enum indicating which versions to support:
+         * VERSION_1: use only version 1 of the protocol
+         * VERSION_2_ALLOW_1: suggest version 2 but allow downgrade to version 1
+         * VERSION_2: suggest version 2 and enforce use of version 2
+         *
+         */
+        PaymentChannelClient.VersionSelector versionSelector();
     }
 
     /**

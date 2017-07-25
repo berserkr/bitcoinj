@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright 2012 Matt Corallo.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,26 +38,26 @@ public class TransactionOutputChanges {
     }
     
     public TransactionOutputChanges(InputStream in) throws IOException {
-        int numOutsCreated = ((in.read() & 0xFF) << 0) |
+        int numOutsCreated = (in.read() & 0xFF) |
                              ((in.read() & 0xFF) << 8) |
                              ((in.read() & 0xFF) << 16) |
                              ((in.read() & 0xFF) << 24);
-        txOutsCreated = new LinkedList<UTXO>();
+        txOutsCreated = new LinkedList<>();
         for (int i = 0; i < numOutsCreated; i++)
             txOutsCreated.add(new UTXO(in));
         
-        int numOutsSpent = ((in.read() & 0xFF) << 0) |
+        int numOutsSpent = (in.read() & 0xFF) |
                            ((in.read() & 0xFF) << 8) |
                            ((in.read() & 0xFF) << 16) |
                            ((in.read() & 0xFF) << 24);
-        txOutsSpent = new LinkedList<UTXO>();
+        txOutsSpent = new LinkedList<>();
         for (int i = 0; i < numOutsSpent; i++)
             txOutsSpent.add(new UTXO(in));
     }
 
     public void serializeToStream(OutputStream bos) throws IOException {
         int numOutsCreated = txOutsCreated.size();
-        bos.write(0xFF & (numOutsCreated >> 0));
+        bos.write(0xFF & numOutsCreated);
         bos.write(0xFF & (numOutsCreated >> 8));
         bos.write(0xFF & (numOutsCreated >> 16));
         bos.write(0xFF & (numOutsCreated >> 24));
@@ -66,7 +66,7 @@ public class TransactionOutputChanges {
         }
         
         int numOutsSpent = txOutsSpent.size();
-        bos.write(0xFF & (numOutsSpent >> 0));
+        bos.write(0xFF & numOutsSpent);
         bos.write(0xFF & (numOutsSpent >> 8));
         bos.write(0xFF & (numOutsSpent >> 16));
         bos.write(0xFF & (numOutsSpent >> 24));

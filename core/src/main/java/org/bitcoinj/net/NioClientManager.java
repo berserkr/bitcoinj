@@ -18,6 +18,7 @@ package org.bitcoinj.net;
 
 import com.google.common.base.Throwables;
 import com.google.common.util.concurrent.*;
+import org.bitcoinj.utils.*;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
@@ -39,13 +40,13 @@ public class NioClientManager extends AbstractExecutionThreadService implements 
 
     class PendingConnect {
         SocketChannel sc;
-        StreamParser parser;
+        StreamConnection connection;
         SocketAddress address;
         SettableFuture<SocketAddress> future = SettableFuture.create();
 
-        PendingConnect(SocketChannel sc, StreamParser parser, SocketAddress address) { this.sc = sc; this.parser = parser; this.address = address; }
+        PendingConnect(SocketChannel sc, StreamConnection connection, SocketAddress address) { this.sc = sc; this.connection = connection; this.address = address; }
     }
-    final Queue<PendingConnect> newConnectionChannels = new LinkedBlockingQueue<PendingConnect>();
+    final Queue<PendingConnect> newConnectionChannels = new LinkedBlockingQueue<>();
 
     // Added to/removed from by the individual ConnectionHandler's, thus must by synchronized on its own.
     private final Set<ConnectionHandler> connectedHandlers = Collections.synchronizedSet(new HashSet<ConnectionHandler>());
@@ -56,14 +57,14 @@ public class NioClientManager extends AbstractExecutionThreadService implements 
         if (key.isValid() && key.isConnectable()) { // ie a client connection which has finished the initial connect process
             // Create a ConnectionHandler and hook everything together
             PendingConnect data = (PendingConnect) key.attachment();
-            StreamParser parser = data.parser;
+            StreamConnection connection = data.connection;
             SocketChannel sc = (SocketChannel) key.channel();
-            ConnectionHandler handler = new ConnectionHandler(parser, key, connectedHandlers);
+            ConnectionHandler handler = new ConnectionHandler(connection, key, connectedHandlers);
             try {
                 if (sc.finishConnect()) {
-                    log.info("Successfully connected to {}", sc.socket().getRemoteSocketAddress());
+                    log.info("Connected to {}", sc.socket().getRemoteSocketAddress());
                     key.interestOps((key.interestOps() | SelectionKey.OP_READ) & ~SelectionKey.OP_CONNECT).attach(handler);
-                    parser.connectionOpened();
+                    connection.connectionOpened();
                     data.future.set(data.address);
                 } else {
                     log.warn("Failed to connect to {}", sc.socket().getRemoteSocketAddress());
@@ -76,7 +77,7 @@ public class NioClientManager extends AbstractExecutionThreadService implements 
                 // may cause this. Otherwise it may be any arbitrary kind of connection failure.
                 // Calling sc.socket().getRemoteSocketAddress() here throws an exception, so we can only log the error itself
                 Throwable cause = Throwables.getRootCause(e);
-                log.warn("Failed to connect with exception: {}: {}", cause.getClass().getName(), cause.getMessage());
+                log.warn("Failed to connect with exception: {}: {}", cause.getClass().getName(), cause.getMessage(), e);
                 handler.closeConnection();
                 data.future.setException(cause);
                 data.future = null;
@@ -144,15 +145,15 @@ public class NioClientManager extends AbstractExecutionThreadService implements 
     }
 
     @Override
-    public ListenableFuture<SocketAddress> openConnection(SocketAddress serverAddress, StreamParser parser) {
+    public ListenableFuture<SocketAddress> openConnection(SocketAddress serverAddress, StreamConnection connection) {
         if (!isRunning())
             throw new IllegalStateException();
-        // Create a new connection, give it a parser as an attachment
+        // Create a new connection, give it a connection as an attachment
         try {
             SocketChannel sc = SocketChannel.open();
             sc.configureBlocking(false);
             sc.connect(serverAddress);
-            PendingConnect data = new PendingConnect(sc, parser, serverAddress);
+            PendingConnect data = new PendingConnect(sc, connection, serverAddress);
             newConnectionChannels.offer(data);
             selector.wakeup();
             return data.future;
@@ -188,9 +189,7 @@ public class NioClientManager extends AbstractExecutionThreadService implements 
         return new Executor() {
             @Override
             public void execute(Runnable command) {
-                Thread thread = new Thread(command, "NioClientManager");
-                thread.setDaemon(true);
-                thread.start();
+                new ContextPropagatingThreadFactory("NioClientManager").newThread(command).start();
             }
         };
     }

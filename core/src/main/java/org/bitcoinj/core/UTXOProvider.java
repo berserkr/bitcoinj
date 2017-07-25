@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright 2014 Kalpesh Parmar.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.bitcoinj.core;
 
 import java.util.List;
@@ -25,12 +26,12 @@ import java.util.List;
  */
 public interface UTXOProvider {
 
+    // TODO currently the access to outputs is by address. Change to ECKey
     /**
-     * // TODO currently the access to outputs is by address. Change to ECKey
      * Get the list of {@link UTXO}'s for a given address.
      * @param addresses List of address.
      * @return The list of transaction outputs.
-     * @throws UTXOProvider If there is an error.
+     * @throws UTXOProviderException If there is an error.
      */
     List<UTXO> getOpenTransactionOutputs(List<Address> addresses) throws UTXOProviderException;
 
